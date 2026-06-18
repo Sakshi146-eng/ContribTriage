@@ -1,0 +1,23 @@
+# Primary runtime dependencies
+requests>=2.28.0
+networkx>=3.2
+rich>=13.0.0
+
+# Async support
+aiohttp>=3.9.0
+
+# Data handling
+pandas>=2.0.0
+pydantic>=2.0.0
+
+# Comments and blank lines should be skipped
+
+# Git installs should be skipped
+# git+https://github.com/some/repo.git
+
+# URL installs should be skipped
+# https://example.com/some-package.tar.gz
+
+# Dev extras (separate file usually, but testing mixed)
+pytest>=7.4
+pytest-cov>=4.1

@@ -1,0 +1,26 @@
+{
+  "name": "my-frontend-app",
+  "version": "1.0.0",
+  "description": "A sample Node.js application for testing",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "build": "tsc",
+    "test": "jest --coverage",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "express": "^4.18.0",
+    "lodash": "^4.17.21"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0",
+    "typescript": "^5.0.0",
+    "eslint": "^8.0.0",
+    "@types/node": "^20.0.0"
+  }
+}

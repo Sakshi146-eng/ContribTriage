@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "contribtriage"
+version = "0.1.0"
+description = "Automated open-source contributor onboarding: maps codebases, audits environments, resolves dependencies, and surfaces contribution pathways."
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+dependencies = [
+    # ── Graph engine — structural codebase map ───────────────────────────
+    "networkx>=3.2",
+
+    # ── Vector store + local CPU embeddings ──────────────────────────────
+    # [fastembed] extra pulls in BAAI/bge-small-en-v1.5 model automatically
+    "qdrant-client[fastembed]>=1.9.0",
+    "fastembed>=0.3.0",
+
+    # ── LangGraph orchestrator ────────────────────────────────────────────
+    "langgraph>=0.2.0",
+    "langchain-core>=0.3.0",
+
+    # ── LLM APIs ──────────────────────────────────────────────────────────
+    # Groq: sub-second Llama 3 inference for real-time traceback analysis
+    "groq>=0.9.0",
+    # Gemini 2.5 Flash: large-context report synthesis
+    "google-genai>=1.0.0",
+
+    # ── API key management ────────────────────────────────────────────────
+    # Primary: system env vars (GROQ_API_KEY, GEMINI_API_KEY)
+    # Fallback: .env file at repo root
+    "python-dotenv>=1.0.0",
+
+    # ── TOML parsing (stdlib tomllib in 3.11+, backport for 3.9/3.10) ────
+    "tomli>=2.0.0; python_version < '3.11'",
+
+    # ── Rich terminal output — progress bars, panels, colored diffs ───────
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytest-mock>=3.12",   # for mocking LLM calls and Qdrant in tests
+]
+
+[project.scripts]
+# After `pip install -e .`, contributors run: contribtriage --repo-path ./some-repo
+contribtriage = "contribtriage.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["contribtriage"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
