@@ -16,6 +16,13 @@ Supported frameworks
   pnpm test     pnpm test
   yarn test     yarn test
 
+Selective rerun
+───────────────
+  When failed_test_ids is provided, only those tests are re-executed:
+    pytest  → appends -k "test_a or test_b"
+  This is a core feature of the healing loop: after a fix is applied,
+  only the previously-failing tests are re-run for speed.
+
 Design decisions
 ────────────────
   - Never raises: subprocess failures are caught and surfaced in TestResult.
@@ -75,19 +82,28 @@ def run_tests(
     repo_root: str,
     test_framework: str,
     timeout: int = DEFAULT_TIMEOUT,
+    failed_test_ids: Optional[List[str]] = None,
 ) -> TestResult:
     """
     Run the project's test suite and return a structured TestResult.
 
     Args:
-        repo_root:      Absolute path to the repository root (cwd for the run).
-        test_framework: Framework key from _COMMANDS, e.g. 'pytest', 'go test'.
-        timeout:        Maximum seconds to wait before killing the subprocess.
+        repo_root:       Absolute path to the repository root (cwd for the run).
+        test_framework:  Framework key from _COMMANDS, e.g. 'pytest', 'go test'.
+        timeout:         Maximum seconds to wait before killing the subprocess.
+        failed_test_ids: If provided, only run these specific tests (selective
+                         rerun used by the healing loop after a fix is applied).
+                         Supported for ALL frameworks:
+                           pytest      → -k "name_a or name_b"
+                           unittest    → -k "name_a or name_b"  (via pytest runner)
+                           cargo test  → positional filter (cargo test name_frag)
+                           go test     → -run "TestA|TestB" regex
+                           npm/pnpm/yarn → -- -t "name_a|name_b" (Jest pattern)
 
     Returns:
         Populated TestResult. Never raises — all errors are captured inside it.
     """
-    cmd = _build_command(test_framework)
+    cmd = _build_command(test_framework, failed_test_ids)
     ecosystem = _ECOSYSTEM.get(test_framework, "python")
     result = TestResult(
         source="existing",
@@ -136,13 +152,72 @@ def run_tests(
 # Command Builder
 # ===========================================================================
 
-def _build_command(framework: str) -> List[str]:
+def _build_command(
+    framework: str,
+    failed_test_ids: Optional[List[str]] = None,
+) -> List[str]:
     """
-    Return the shell command list for the given framework key.
+    Return the shell command list for the given framework, with selective
+    rerun support for ALL supported test frameworks.
 
-    Falls back to pytest if the framework is unknown.
+    How each framework filters tests
+    ────────────────────────────────
+      pytest / unittest
+        Appends -k "name_a or name_b" using the bare function name extracted
+        from "tests/test_foo.py::TestClass::test_method" → "test_method".
+
+      cargo test
+        Appends the filter as a positional argument: `cargo test name_fragment`.
+        Cargo runs tests whose full path *contains* the fragment as a substring.
+        Uses the first failing test name only (cargo supports one filter token).
+
+      go test
+        Appends -run "TestA|TestB" as a regex. Extracts the test function name
+        from the Go FAIL line (e.g. "--- FAIL: TestFoo" → "TestFoo").
+
+      npm / pnpm / yarn  (Jest)
+        Appends -- -t "name_a|name_b" so Jest runs matching describe/test blocks.
+        The bare test name is used (last token after any :: separators).
+
+    Falls back to the full suite command if framework is unknown.
     """
-    return list(_COMMANDS.get(framework, _COMMANDS["pytest"]))
+    cmd = list(_COMMANDS.get(framework, _COMMANDS["pytest"]))
+
+    if not failed_test_ids:
+        return cmd
+
+    # ── pytest / unittest ─────────────────────────────────────────────────
+    if framework in ("pytest", "unittest"):
+        names = [tid.split("::")[-1] for tid in failed_test_ids if "::" in tid]
+        names = names or list(failed_test_ids)
+        cmd.extend(["-k", " or ".join(names)])
+
+    # ── cargo test ────────────────────────────────────────────────────────
+    elif framework == "cargo test":
+        # Cargo takes a single name-substring filter as a positional argument.
+        # Use the first failing test name (strip module path prefix if present).
+        raw = failed_test_ids[0]
+        # "tests::module::test_name" → "test_name"
+        fragment = raw.split("::")[-1] if "::" in raw else raw
+        cmd.append(fragment)
+
+    # ── go test ───────────────────────────────────────────────────────────
+    elif framework == "go test":
+        # Extract bare TestFoo names; join as regex alternation.
+        names = [tid.split("::")[-1] if "::" in tid else tid
+                 for tid in failed_test_ids]
+        run_pattern = "|".join(names)
+        cmd.extend(["-run", run_pattern])
+
+    # ── npm / pnpm / yarn (Jest) ──────────────────────────────────────────
+    elif framework in ("npm test", "pnpm test", "yarn test"):
+        names = [tid.split("::")[-1] if "::" in tid else tid
+                 for tid in failed_test_ids]
+        pattern = "|".join(names)
+        # "--" separates npm args from the test runner args
+        cmd.extend(["--", "-t", pattern])
+
+    return cmd
 
 
 # ===========================================================================

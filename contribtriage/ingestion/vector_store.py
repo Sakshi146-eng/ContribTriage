@@ -121,7 +121,7 @@ class VectorStore:
 
         Automatically checks GEMINI_API_KEY env var if *gemini_api_key* is None.
         """
-        key = gemini_api_key or os.getenv("GEMINI_API_KEY")
+        key = gemini_api_key or os.getenv("GEMINI_EMBEDDING_API_KEY")
         store_path = str(Path(repo_root) / ".contribtriage_qdrant")
         return cls(store_path=store_path, gemini_api_key=key)
 

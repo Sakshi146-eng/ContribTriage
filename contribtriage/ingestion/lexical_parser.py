@@ -1,24 +1,30 @@
 """
 contribtriage/ingestion/lexical_parser.py
 
-Stage 1a — Universal Lexical Parser.
+Stage 1a — Universal Lexical Parser (Tree-sitter edition).
 
-Instead of language-specific compiler toolchains, this module uses curated
-regex signatures to extract structural maps across Python, JavaScript,
-TypeScript, Rust, and Go. This keeps the parser dependency-free, fast,
-and resilient — it never crashes due to a missing compiler or syntax error.
+Uses Tree-sitter ASTs instead of regexes for precise, language-native extraction
+across Python, JavaScript/JSX, TypeScript/TSX, Rust, and Go.
+
+Tree-sitter 0.23+ API (modern precompiled wheels):
+    import tree_sitter_python as tspython
+    from tree_sitter import Language, Parser
+    lang = Language(tspython.language())
+    parser = Parser(lang)
+
+Query captures() returns dict[str, list[Node]] in 0.23+.
 
 Extracted per file:
-  - Class / struct / interface / enum definitions
-  - Function / method definitions
-  - Import / require / use / mod statements
+  - Class / struct / interface / enum / trait definitions
+  - Function / method / arrow-function definitions
+  - Import / use / require statements (as raw text, normalised in Python)
   - TODO / FIXME / BUG / HACK inline comments
 
-Output: a populated KnowledgeGraph dataclass backed by a NetworkX DiGraph.
+Output: a populated KnowledgeGraph backed by NetworkX DiGraph.
 
 Graph schema:
-  V = {module nodes}     identified by dot-separated logical name
-  E = {import edges}     directed: (importer → imported), labelled 'imports'
+  V = {module nodes}   identified by dot-separated logical name
+  E = {import edges}   directed: (importer → imported), labelled 'imports'
 """
 
 from __future__ import annotations
@@ -33,155 +39,186 @@ import networkx as nx
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+# ── Tree-sitter 0.23 modern API ───────────────────────────────────────────
+import tree_sitter_go        as tsgo
+import tree_sitter_javascript as tsjs
+import tree_sitter_python    as tspy
+import tree_sitter_rust      as tsrs
+import tree_sitter_typescript as tsts
+from tree_sitter import Language, Parser
+
 from contribtriage.exceptions import IngestionError
 from contribtriage.models import KnowledgeGraph, ModuleNode, NonPythonFile
 
-console = Console()
+console = Console(force_terminal=True, highlight=False)
+
+# ===========================================================================
+# Language initialisation (once at import time — zero overhead per file)
+# ===========================================================================
+
+_LANG_PY  = Language(tspy.language())
+_LANG_JS  = Language(tsjs.language())
+_LANG_TS  = Language(tsts.language_typescript())
+_LANG_TSX = Language(tsts.language_tsx())
+_LANG_GO  = Language(tsgo.language())
+_LANG_RS  = Language(tsrs.language())
 
 
 # ===========================================================================
-# Language Configuration
+# Language Configuration (Tree-sitter edition)
 # ===========================================================================
 
 @dataclass
 class LanguageConfig:
-    """Regex bundle for one programming language."""
+    """Tree-sitter query bundle for one programming language."""
     language: str
-    class_pattern: re.Pattern
-    function_pattern: re.Pattern
-    import_patterns: List[re.Pattern]
-    todo_pattern: re.Pattern
+    ts_language: Language       # Compiled Language object
+    func_queries: List[str]     # S-expression query strings → capture @name
+    class_queries: List[str]    # S-expression query strings → capture @name
+    import_stmts_query: str     # S-expression query string → capture @stmt (full text)
+    import_src_query: str       # S-expression query string → capture @src (source value only)
+    todo_pattern: re.Pattern    # Regex for TODO/FIXME comments (language-agnostic)
 
 
-# Build the configs at module load — compiled once, reused for every file.
-_TODO_PYTHON   = re.compile(r"#\s*(TODO|FIXME|BUG|HACK|XXX)[:\s]+(.*)", re.IGNORECASE)
-_TODO_C_STYLE  = re.compile(r"//\s*(TODO|FIXME|BUG|HACK|XXX)[:\s]+(.*)", re.IGNORECASE)
+_TODO_PY    = re.compile(r"#\s*(TODO|FIXME|BUG|HACK|XXX)[:\s]+(.*)", re.IGNORECASE)
+_TODO_C     = re.compile(r"//\s*(TODO|FIXME|BUG|HACK|XXX)[:\s]+(.*)", re.IGNORECASE)
 
 LANGUAGE_CONFIGS: Dict[str, LanguageConfig] = {
 
     # ── Python ──────────────────────────────────────────────────────────
     ".py": LanguageConfig(
         language="Python",
-        class_pattern=re.compile(
-            r"^class\s+(\w+)", re.MULTILINE
-        ),
-        function_pattern=re.compile(
-            r"^(?:async\s+)?def\s+(\w+)", re.MULTILINE
-        ),
-        import_patterns=[
-            re.compile(r"^import\s+([\w.]+)", re.MULTILINE),
-            re.compile(r"^from\s+([\w.]+)\s+import", re.MULTILINE),
+        ts_language=_LANG_PY,
+        func_queries=[
+            "(function_definition name: (identifier) @name)",
         ],
-        todo_pattern=_TODO_PYTHON,
+        class_queries=[
+            "(class_definition name: (identifier) @name)",
+        ],
+        import_stmts_query="[(import_statement) (import_from_statement)] @stmt",
+        import_src_query="",   # parsed from full stmt text
+        todo_pattern=_TODO_PY,
     ),
 
-    # ── JavaScript ──────────────────────────────────────────────────────
+    # ── JavaScript / JSX ────────────────────────────────────────────────
     ".js": LanguageConfig(
         language="JavaScript",
-        class_pattern=re.compile(
-            r"\bclass\s+(\w+)", re.MULTILINE
-        ),
-        function_pattern=re.compile(
-            r"(?:^|\s)(?:export\s+)?(?:async\s+)?function\s+(\w+)"
-            r"|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(",
-            re.MULTILINE,
-        ),
-        import_patterns=[
-            re.compile(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)""", re.MULTILINE),
-            re.compile(r"""from\s+['"]([^'"]+)['"]""", re.MULTILINE),
-            re.compile(r"""import\s+['"]([^'"]+)['"]""", re.MULTILINE),
+        ts_language=_LANG_JS,
+        func_queries=[
+            "(function_declaration name: (identifier) @name)",
+            "(method_definition name: (property_identifier) @name)",
+            "(lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function)))",
+            "(lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression)))",
+            "(variable_declaration (variable_declarator name: (identifier) @name value: (arrow_function)))",
         ],
-        todo_pattern=_TODO_C_STYLE,
+        class_queries=[
+            "(class_declaration name: (identifier) @name)",
+        ],
+        import_stmts_query="(import_statement) @stmt",
+        import_src_query='(import_statement source: (string (string_fragment) @src))',
+        todo_pattern=_TODO_C,
     ),
 
-    # ── TypeScript (same as JS + extra patterns) ─────────────────────────
+    # ── TypeScript ──────────────────────────────────────────────────────
     ".ts": LanguageConfig(
         language="TypeScript",
-        class_pattern=re.compile(
-            r"\b(?:class|interface|type)\s+(\w+)", re.MULTILINE
-        ),
-        function_pattern=re.compile(
-            r"(?:^|\s)(?:export\s+)?(?:async\s+)?function\s+(\w+)"
-            r"|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(",
-            re.MULTILINE,
-        ),
-        import_patterns=[
-            re.compile(r"""from\s+['"]([^'"]+)['"]""", re.MULTILINE),
-            re.compile(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)""", re.MULTILINE),
-            re.compile(r"""import\s+type\s+.*\s+from\s+['"]([^'"]+)['"]""", re.MULTILINE),
+        ts_language=_LANG_TS,
+        func_queries=[
+            "(function_declaration name: (identifier) @name)",
+            "(method_definition name: (property_identifier) @name)",
+            "(lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function)))",
+            "(lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression)))",
         ],
-        todo_pattern=_TODO_C_STYLE,
+        class_queries=[
+            "(class_declaration name: (type_identifier) @name)",
+            "(interface_declaration name: (type_identifier) @name)",
+            "(type_alias_declaration name: (type_identifier) @name)",
+        ],
+        import_stmts_query="(import_statement) @stmt",
+        import_src_query='(import_statement source: (string (string_fragment) @src))',
+        todo_pattern=_TODO_C,
     ),
 
-    # ── TSX / JSX (React components — same structural patterns) ──────────
-    ".tsx": None,  # filled below by reference
-    ".jsx": None,
+    # ── TSX / JSX (React) ───────────────────────────────────────────────
+    ".tsx": LanguageConfig(
+        language="TypeScript/React",
+        ts_language=_LANG_TSX,
+        func_queries=[
+            "(function_declaration name: (identifier) @name)",
+            "(lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function)))",
+            "(lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression)))",
+        ],
+        class_queries=[
+            "(class_declaration name: (type_identifier) @name)",
+            "(interface_declaration name: (type_identifier) @name)",
+        ],
+        import_stmts_query="(import_statement) @stmt",
+        import_src_query='(import_statement source: (string (string_fragment) @src))',
+        todo_pattern=_TODO_C,
+    ),
+    ".jsx": LanguageConfig(
+        language="JavaScript/React",
+        ts_language=_LANG_JS,
+        func_queries=[
+            "(function_declaration name: (identifier) @name)",
+            "(lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function)))",
+            "(lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression)))",
+        ],
+        class_queries=[
+            "(class_declaration name: (identifier) @name)",
+        ],
+        import_stmts_query="(import_statement) @stmt",
+        import_src_query='(import_statement source: (string (string_fragment) @src))',
+        todo_pattern=_TODO_C,
+    ),
 
     # ── Rust ─────────────────────────────────────────────────────────────
     ".rs": LanguageConfig(
         language="Rust",
-        class_pattern=re.compile(
-            r"^(?:pub(?:\s*\([^)]*\))?\s+)?(?:struct|enum|trait|impl)\s+(\w+)",
-            re.MULTILINE,
-        ),
-        function_pattern=re.compile(
-            # No ^ anchor — impl block methods are indented, not at column 0
-            r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)",
-            re.MULTILINE,
-        ),
-        import_patterns=[
-            re.compile(r"^use\s+([\w:]+(?:::\{[^}]+\})?)", re.MULTILINE),
-            re.compile(r"^extern\s+crate\s+(\w+)", re.MULTILINE),
-            re.compile(r"^mod\s+(\w+)", re.MULTILINE),
+        ts_language=_LANG_RS,
+        func_queries=[
+            "(function_item name: (identifier) @name)",
         ],
-        todo_pattern=_TODO_C_STYLE,
+        class_queries=[
+            "(struct_item name: (type_identifier) @name)",
+            "(enum_item name: (type_identifier) @name)",
+            "(trait_item name: (type_identifier) @name)",
+            "(impl_item type: (type_identifier) @name)",
+        ],
+        import_stmts_query="(use_declaration) @stmt",
+        import_src_query="",   # parsed from use text
+        todo_pattern=_TODO_C,
     ),
 
     # ── Go ───────────────────────────────────────────────────────────────
     ".go": LanguageConfig(
         language="Go",
-        class_pattern=re.compile(
-            r"^type\s+(\w+)\s+(?:struct|interface)", re.MULTILINE
-        ),
-        function_pattern=re.compile(
-            r"^func\s+(?:\(\s*\w+\s+\*?\w+\s*\)\s+)?(\w+)", re.MULTILINE
-        ),
-        import_patterns=[
-            # matches both single `import "pkg"` and block `import (\n"pkg"\n)`
-            re.compile(r'"([\w./\-]+)"', re.MULTILINE),
+        ts_language=_LANG_GO,
+        func_queries=[
+            "(function_declaration name: (identifier) @name)",
+            "(method_declaration name: (field_identifier) @name)",
         ],
-        todo_pattern=_TODO_C_STYLE,
+        class_queries=[
+            "(type_spec name: (type_identifier) @name)",
+        ],
+        import_stmts_query="",  # handled by import_src_query directly
+        import_src_query="(import_spec path: (interpreted_string_literal) @src)",
+        todo_pattern=_TODO_C,
     ),
 }
 
-# Fill aliases
-LANGUAGE_CONFIGS[".tsx"] = LanguageConfig(
-    language="TypeScript/React",
-    class_pattern=LANGUAGE_CONFIGS[".ts"].class_pattern,
-    function_pattern=LANGUAGE_CONFIGS[".ts"].function_pattern,
-    import_patterns=LANGUAGE_CONFIGS[".ts"].import_patterns,
-    todo_pattern=_TODO_C_STYLE,
-)
-LANGUAGE_CONFIGS[".jsx"] = LanguageConfig(
-    language="JavaScript/React",
-    class_pattern=LANGUAGE_CONFIGS[".js"].class_pattern,
-    function_pattern=LANGUAGE_CONFIGS[".js"].function_pattern,
-    import_patterns=LANGUAGE_CONFIGS[".js"].import_patterns,
-    todo_pattern=_TODO_C_STYLE,
-)
-
-# Extensions that are code files (get structurally parsed)
+# Extensions that are structured code files
 CODE_EXTENSIONS: Set[str] = set(LANGUAGE_CONFIGS.keys())
 
-# Non-code file categorization map  (extension → category label)
+# Non-code file categorization
 _EXT_CATEGORY: Dict[str, str] = {
-    ".md":   "docs",   ".rst":  "docs",  ".txt": "docs",
-    ".yml":  "ci",     ".yaml": "ci",
+    ".md":   "docs",  ".rst":  "docs",  ".txt": "docs",
+    ".yml":  "ci",    ".yaml": "ci",
     ".json": "config", ".toml": "config", ".ini": "config",
     ".cfg":  "config", ".env":  "config",
     ".sh":   "config", ".bash": "config", ".zsh": "config",
     ".css":  "frontend", ".scss": "frontend", ".html": "frontend",
-    ".csv":  "data",   ".xml":  "data",
+    ".csv":  "data",  ".xml":  "data",
 }
 _DOCKER_NAMES = {"dockerfile", "docker-compose.yml", "docker-compose.yaml"}
 
@@ -191,7 +228,7 @@ _SKIP_DIRS: Set[str] = {
     "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     "node_modules", ".venv", "venv", "env", ".env",
     "dist", "build", ".next", ".nuxt",
-    "site-packages", ".contribtriage_qdrant",
+    "site-packages", ".contribtriage_qdrant", ".contribtriage",
 }
 
 
@@ -204,8 +241,8 @@ def build_knowledge_graph(
     output_dir: Optional[str] = None,
 ) -> KnowledgeGraph:
     """
-    Parse every supported source file under *repo_root* and return a
-    populated KnowledgeGraph.
+    Parse every supported source file under *repo_root* using Tree-sitter
+    and return a populated KnowledgeGraph.
 
     Args:
         repo_root:   Absolute path to the cloned repository.
@@ -216,30 +253,30 @@ def build_knowledge_graph(
         KnowledgeGraph with nodes, edges, uncovered_funcs, non_python_files,
         file_type_summary, language_summary, and graph_json_path set.
     """
-    root = Path(repo_root).resolve()
+    root    = Path(repo_root).resolve()
     out_dir = Path(output_dir) if output_dir else root / ".contribtriage"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_files = _collect_all_files(root)
+    all_files  = _collect_all_files(root)
     code_files = [f for f in all_files if f.suffix in CODE_EXTENSIONS]
     other_files = [f for f in all_files if f.suffix not in CODE_EXTENSIONS]
 
     console.print(
-        f"[cyan]  → {len(code_files)} code files, "
+        f"[cyan]  -> {len(code_files)} code files, "
         f"{len(other_files)} other files found[/cyan]"
     )
 
-    graph = nx.DiGraph()
+    graph         = nx.DiGraph()
     nodes: Dict[str, ModuleNode] = {}
     ingest_errors: List[str] = []
 
     with Progress(
-        SpinnerColumn(),
+        SpinnerColumn(spinner_name="line"),
         TextColumn("[progress.description]{task.description}"),
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task("Parsing source files...", total=len(code_files))
+        task = progress.add_task("Parsing source files (Tree-sitter)...", total=len(code_files))
 
         for f in code_files:
             progress.advance(task)
@@ -251,40 +288,36 @@ def build_knowledge_graph(
                 node = _parse_file(f, module_name, cfg)
             except IngestionError as exc:
                 ingest_errors.append(str(exc))
-                console.print(
-                    f"[yellow]  ⚠ Skipped: {f.name} — {exc}[/yellow]"
-                )
+                console.print(f"[yellow]  [!] Skipped: {f.name} — {exc}[/yellow]")
                 continue
             nodes[module_name] = node
             graph.add_node(module_name, **_node_to_attrs(node))
 
-    # Build directed import edges between known project modules
-    edges = _build_import_edges(nodes, graph)
+    # Build directed import edges with relative-path resolution
+    edges = _build_import_edges(nodes, graph, root)
 
     # Classify non-code files
-    non_python: List[NonPythonFile] = [
-        _classify_non_code(f) for f in other_files
-    ]
+    non_python: List[NonPythonFile] = [_classify_non_code(f) for f in other_files]
 
-    # Cross-ref test modules to find uncovered public functions
+    # Cross-ref test modules → find uncovered public functions (all languages)
     test_modules = {n for n in nodes if "test" in n.lower()}
-    uncovered = _find_uncovered(nodes, test_modules)
+    uncovered    = _find_uncovered(nodes, test_modules)
 
     # Aggregate stats
     file_type_summary = _count_by_ext(all_files)
     language_summary  = _count_by_language(nodes)
 
-    # Serialize graph
+    # Serialise graph
     graph_json_path = out_dir / "graph.json"
     _write_graph(graph, graph_json_path)
 
     if ingest_errors:
         console.print(
-            f"[yellow]  ⚠ {len(ingest_errors)} file(s) skipped during parsing[/yellow]"
+            f"[yellow]  [!] {len(ingest_errors)} file(s) skipped during parsing[/yellow]"
         )
 
     console.print(
-        f"[green]  ✓ Knowledge graph: {len(nodes)} modules, "
+        f"[green]  [OK] Knowledge graph: {len(nodes)} modules, "
         f"{len(edges)} import edges, {len(uncovered)} uncovered functions[/green]"
     )
 
@@ -309,7 +342,6 @@ def _collect_all_files(root: Path) -> List[Path]:
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        # Skip if any parent dir component is in the skip list
         if any(
             part in _SKIP_DIRS or part.endswith(".egg-info")
             for part in path.parts
@@ -323,29 +355,27 @@ def _path_to_logical_name(file: Path, root: Path) -> str:
     """
     Convert an absolute file path to a unique dot-separated logical name.
 
-    Python convention: drop the .py extension and collapse __init__.
+    Python convention: drop .py extension and collapse __init__.
       src/utils.py      → 'src.utils'
       src/__init__.py   → 'src'
 
     Non-Python: keep the extension as an underscore suffix to guarantee
-    uniqueness in polyglot repos where the same stem may exist in multiple
-    languages (e.g. main.py + main.go in the same directory).
+    uniqueness in polyglot repos.
       src/utils.ts      → 'src.utils_ts'
       src/main.go       → 'src.main_go'
       src/lib.rs        → 'src.lib_rs'
     """
-    rel = file.relative_to(root)
-    suffix = file.suffix  # e.g. '.py', '.ts', '.rs'
+    rel    = file.relative_to(root)
+    suffix = file.suffix
 
     if suffix == ".py":
         parts = list(rel.with_suffix("").parts)
         if parts and parts[-1] == "__init__":
             parts = parts[:-1]
     else:
-        # Include extension as underscore suffix on the final segment
         stem_parts = list(rel.with_suffix("").parts)
         if stem_parts:
-            ext_tag = suffix.lstrip(".")       # '.ts' → 'ts'
+            ext_tag = suffix.lstrip(".")
             stem_parts[-1] = f"{stem_parts[-1]}_{ext_tag}"
         parts = stem_parts
 
@@ -353,7 +383,7 @@ def _path_to_logical_name(file: Path, root: Path) -> str:
 
 
 # ===========================================================================
-# Per-File Parsing
+# Per-File Parsing (Tree-sitter)
 # ===========================================================================
 
 def _parse_file(
@@ -362,24 +392,26 @@ def _parse_file(
     cfg: LanguageConfig,
 ) -> ModuleNode:
     """
-    Apply regex patterns for *cfg* to *file* and return a ModuleNode.
+    Parse a single source file with Tree-sitter and return a ModuleNode.
 
     Raises:
         IngestionError: if the file cannot be read (OS error).
-                        SyntaxErrors never occur — we use regex, not AST.
     """
     try:
-        source = file.read_text(encoding="utf-8", errors="replace")
+        source_bytes = file.read_bytes()
     except OSError as exc:
         raise IngestionError(str(file), exc) from exc
 
-    classes   = _extract(cfg.class_pattern, source)
-    functions = _extract(cfg.function_pattern, source)
-    imports   = _extract_imports(cfg.import_patterns, source)
-    todos     = _extract_todos(cfg.todo_pattern, source)
+    source_text = source_bytes.decode("utf-8", errors="replace")
 
-    # Best-effort docstring: first block comment or triple-quoted string
-    docstring = _extract_docstring(source, cfg.language)
+    parser = Parser(cfg.ts_language)
+    tree   = parser.parse(source_bytes)
+
+    functions = _query_names(cfg.ts_language, tree, cfg.func_queries)
+    classes   = _query_names(cfg.ts_language, tree, cfg.class_queries)
+    imports   = _extract_imports(cfg, tree, source_text)
+    todos     = _extract_todos(cfg.todo_pattern, source_text)
+    docstring = _extract_docstring(source_bytes, cfg.language)
 
     return ModuleNode(
         path=str(file),
@@ -393,56 +425,169 @@ def _parse_file(
     )
 
 
-def _extract(pattern: re.Pattern, source: str) -> List[str]:
-    """Find all non-empty capture groups from a pattern."""
-    results = []
-    for match in pattern.finditer(source):
-        # Some patterns have multiple groups (e.g. JS function alternatives)
-        name = next((g for g in match.groups() if g), None)
-        if name:
-            results.append(name)
-    return list(dict.fromkeys(results))  # deduplicate, preserve order
-
-
-def _extract_imports(patterns: List[re.Pattern], source: str) -> List[str]:
-    """Collect all imported module / package names, deduplicated."""
+def _query_names(
+    language: Language,
+    tree,
+    query_strings: List[str],
+) -> List[str]:
+    """
+    Run one or more Tree-sitter queries and collect all @name capture texts.
+    Returns deduplicated list preserving order.
+    """
+    results: List[str] = []
     seen: Set[str] = set()
+    for qs in query_strings:
+        if not qs.strip():
+            continue
+        try:
+            q = language.query(qs)
+            for node in q.captures(tree.root_node).get("name", []):
+                text = node.text.decode("utf-8", errors="replace")
+                if text and text not in seen:
+                    seen.add(text)
+                    results.append(text)
+        except Exception:  # noqa: BLE001 — malformed query on unusual source
+            pass
+    return results
+
+
+def _extract_imports(
+    cfg: LanguageConfig,
+    tree,
+    source_text: str,
+) -> List[str]:
+    """
+    Extract and normalise import/require/use identifiers.
+
+    Returns a list of top-level import names (e.g. 'os', 'react', 'std').
+    """
     imports: List[str] = []
-    for pattern in patterns:
-        for match in pattern.finditer(source):
-            name = next((g for g in match.groups() if g), None)
-            if name and name not in seen:
-                seen.add(name)
-                # Normalise: take top-level name only
-                # Handles: 'os.path' → 'os'  (Python dot-separated)
-                #           'std::fs'  → 'std' (Rust :: separated)
-                #           'some/pkg' → 'some' (Go slash-separated)
-                imports.append(name.split("::")[0].split(".")[0].split("/")[0])
+    seen: Set[str] = set()
+
+    def _add(name: str) -> None:
+        # Normalise to top-level: 'os.path' → 'os', 'std::fs' → 'std', './utils' → 'utils'
+        name = name.strip().strip("'\"")
+        if not name:
+            return
+        # Keep full path for relative JS/TS imports (resolved in edge builder)
+        if name.startswith("."):
+            root_name = name   # keep relative path intact
+        else:
+            root_name = (
+                name.split("::")[0]
+                    .split(".")[0]
+                    .split("/")[-1]   # Go: take last segment for stdlib
+                    .split(" ")[0]    # safety trim
+            )
+        if root_name and root_name not in seen:
+            seen.add(root_name)
+            imports.append(root_name)
+
+    # ── Use language-specific source query if available ──────────────────
+    if cfg.import_src_query:
+        try:
+            q = cfg.ts_language.query(cfg.import_src_query)
+            for node in q.captures(tree.root_node).get("src", []):
+                text = node.text.decode("utf-8", errors="replace").strip('"\'')
+                _add(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── Fall back to full statement text ─────────────────────────────────
+    elif cfg.import_stmts_query:
+        try:
+            q = cfg.ts_language.query(cfg.import_stmts_query)
+            for node in q.captures(tree.root_node).get("stmt", []):
+                stmt = node.text.decode("utf-8", errors="replace")
+                _parse_import_stmt(stmt, cfg.language, seen, imports)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── Go: import_src_query only ─────────────────────────────────────────
+    #    (handled above already — Go only uses import_src_query)
+
+    # ── Rust: also catch extern crate declarations ─────────────────────────
+    if cfg.language == "Rust":
+        try:
+            q = cfg.ts_language.query("(extern_crate_declaration name: (identifier) @name)")
+            for node in q.captures(tree.root_node).get("name", []):
+                text = node.text.decode("utf-8", errors="replace")
+                _add(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── JS/TS: also catch require() calls ─────────────────────────────────
+    if cfg.language in ("JavaScript", "JavaScript/React", "TypeScript", "TypeScript/React"):
+        for m in re.finditer(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)""", source_text):
+            _add(m.group(1))
+
     return imports
 
 
-def _extract_todos(pattern: re.Pattern, source: str) -> List[str]:
+def _parse_import_stmt(stmt: str, language: str, seen: Set[str], imports: List[str]) -> None:
+    """Parse the raw text of an import statement to extract module names."""
+    stmt = stmt.strip()
+
+    if language == "Python":
+        # "import os.path" → "os"
+        # "from contribtriage.models import X" → "contribtriage"
+        if stmt.startswith("from "):
+            parts = stmt.split()
+            if len(parts) >= 2:
+                mod = parts[1].split(".")[0]
+                if mod and mod not in seen:
+                    seen.add(mod)
+                    imports.append(mod)
+        elif stmt.startswith("import "):
+            # "import os, sys" → ["os", "sys"]
+            rest = stmt[len("import "):].strip()
+            for part in rest.split(","):
+                mod = part.strip().split(".")[0].split(" ")[0]
+                if mod and mod not in seen:
+                    seen.add(mod)
+                    imports.append(mod)
+
+    elif language in ("Rust",):
+        # "use std::collections::HashMap;" → "std"
+        # "use crate::models::X;" → "crate" (we keep "crate" as-is for edge matching)
+        # NOTE: str.lstrip("use ") strips individual chars, NOT the prefix. Use slice instead.
+        if stmt.startswith("use "):
+            rest = stmt[4:].rstrip(";").strip()
+        else:
+            rest = stmt.rstrip(";").strip()
+        root = rest.split("::")[0].strip()
+        if root and root not in seen:
+            seen.add(root)
+            imports.append(root)
+
+
+def _extract_todos(pattern: re.Pattern, source_text: str) -> List[str]:
     """Extract TODO / FIXME / BUG / HACK comment text."""
     todos = []
-    for match in pattern.finditer(source):
-        tag  = match.group(1).upper()
-        text = match.group(2).strip()
+    for m in pattern.finditer(source_text):
+        tag  = m.group(1).upper()
+        text = m.group(2).strip()
         todos.append(f"{tag}: {text}")
     return todos
 
 
-def _extract_docstring(source: str, language: str) -> Optional[str]:
+def _extract_docstring(source_bytes: bytes, language: str) -> Optional[str]:
     """
     Best-effort extraction of the file's top-level documentation comment.
-    Returns the first triple-quoted string (Python) or block comment (JS/Rust/Go).
+
+    Python: first triple-quoted string.
+    Others: first block comment (/* ... */) or line comment (// ...) block.
     """
+    source_head = source_bytes[:600].decode("utf-8", errors="replace")
     if language == "Python":
-        m = re.search(r'"""(.*?)"""', source[:500], re.DOTALL)
+        m = re.search(r'"""(.*?)"""', source_head, re.DOTALL)
+        if m:
+            return m.group(1).strip()[:300]
+        m = re.search(r"'''(.*?)'''", source_head, re.DOTALL)
         if m:
             return m.group(1).strip()[:300]
     else:
-        # C-style block comment: /* ... */
-        m = re.search(r"/\*(.*?)\*/", source[:500], re.DOTALL)
+        m = re.search(r"/\*(.*?)\*/", source_head, re.DOTALL)
         if m:
             return m.group(1).strip()[:300]
     return None
@@ -455,28 +600,110 @@ def _extract_docstring(source: str, language: str) -> Optional[str]:
 def _build_import_edges(
     nodes: Dict[str, ModuleNode],
     graph: nx.DiGraph,
+    repo_root: Path,
 ) -> List[tuple]:
     """
     Add directed 'imports' edges to the graph for intra-project relationships.
-    Third-party / stdlib imports are recorded in ModuleNode.imports but are
-    NOT added as graph edges (those are handled by the dependency resolver).
+
+    Supports:
+    - Python: dot-separated module name prefix matching
+    - JS/TS/JSX/TSX: relative path resolution (./utils → actual file)
+    - Rust: `crate::` prefix matching
+    - Go: package path last-segment matching
     """
     edges: List[tuple] = []
-    known: Set[str] = set(nodes.keys())
+
+    # Build reverse map: absolute file path → logical module name
+    path_to_logical: Dict[Path, str] = {
+        Path(node.path).resolve(): name
+        for name, node in nodes.items()
+    }
+    known_names: Set[str] = set(nodes.keys())
 
     for src_name, node in nodes.items():
+        src_file = Path(node.path).resolve()
+        src_dir  = src_file.parent
+        language = node.language
+
         for imported in node.imports:
-            # Match project-internal modules by exact name or prefix
-            targets = [
-                m for m in known
-                if m == imported or m.startswith(imported + ".")
-            ]
+            targets = _resolve_import(
+                imported, language, src_dir, repo_root,
+                path_to_logical, known_names,
+            )
             for tgt in targets:
-                if not graph.has_edge(src_name, tgt):
+                if tgt != src_name and not graph.has_edge(src_name, tgt):
                     graph.add_edge(src_name, tgt, relation="imports")
                     edges.append((src_name, tgt, "imports"))
 
     return edges
+
+
+def _resolve_import(
+    imported: str,
+    language: str,
+    src_dir: Path,
+    repo_root: Path,
+    path_to_logical: Dict[Path, str],
+    known_names: Set[str],
+) -> List[str]:
+    """
+    Resolve a raw import string to known module names in this project.
+    Third-party / stdlib imports that don't match anything are ignored.
+    """
+    # ── JS / TS / JSX / TSX: resolve relative paths ──────────────────────
+    if language in (
+        "JavaScript", "JavaScript/React",
+        "TypeScript", "TypeScript/React",
+    ):
+        if imported.startswith("."):
+            # Relative import: try with each code extension
+            base = (src_dir / imported).resolve()
+            for ext in (".jsx", ".tsx", ".js", ".ts", ""):
+                candidate = base.with_suffix(ext) if ext else base
+                if candidate in path_to_logical:
+                    return [path_to_logical[candidate]]
+                # Also try /index variants
+                index_candidate = base / f"index{ext}"
+                if index_candidate in path_to_logical:
+                    return [path_to_logical[index_candidate]]
+            return []
+        else:
+            # Bare npm package: check if it matches an internal module stem
+            stem = imported.replace("-", "_").replace("/", "_")
+            return [
+                n for n in known_names
+                if n.split(".")[-1].replace("_jsx", "").replace("_tsx", "")
+                   .replace("_js", "").replace("_ts", "") == stem
+            ]
+
+    # ── Python: dot-path prefix matching ─────────────────────────────────
+    elif language == "Python":
+        return [
+            n for n in known_names
+            if n == imported or n.startswith(imported + ".")
+        ]
+
+    # ── Rust: crate:: → match within-repo modules ─────────────────────────
+    elif language == "Rust":
+        if imported in ("crate", "self", "super"):
+            return []   # self-references — not useful as graph edges
+        if imported == "std" or imported == "core" or imported == "alloc":
+            return []   # stdlib
+        # Match external crate names against repo module names
+        return [
+            n for n in known_names
+            if n.split(".")[-1].replace("_rs", "").replace("_lib", "") == imported
+        ]
+
+    # ── Go: last path segment matching ───────────────────────────────────
+    elif language == "Go":
+        last_seg = imported.split("/")[-1]
+        return [
+            n for n in known_names
+            if n.split(".")[-1].replace("_go", "") == last_seg
+        ]
+
+    return []
 
 
 def _node_to_attrs(node: ModuleNode) -> dict:
@@ -499,34 +726,53 @@ def _find_uncovered(
     test_modules: Set[str],
 ) -> List[str]:
     """
-    Return 'module.function' strings for public functions that are never
-    referenced in any test module.
+    Return 'module.function' strings for public functions that have NO
+    corresponding test function following the ecosystem naming convention.
 
-    Strategy: collect every identifier present in test file source text
-    via a broad regex scan (function names, variable names, etc.).
-    Any public function NOT appearing there is flagged as uncovered.
+    Convention per language
+    -----------------------
+      Python / Rust / JS / TS:
+          source function   ``validate_schema``
+          expected test     ``test_validate_schema``
+
+      Go:
+          source function   ``RunPipeline``
+          expected test     ``TestRunPipeline``
+
+    A function is "covered" when ANY test module contains a function
+    whose name matches the pattern above.
+
+    This is far more precise than raw token-scanning: a string literal or
+    comment containing the word "login" does NOT count as covering a
+    ``login()`` function.
     """
-    referenced: Set[str] = set()
+    # Collect all test-function names declared in every test module
+    all_test_funcs: Set[str] = set()
     for t_name in test_modules:
-        node = nodes[t_name]
-        referenced.update(node.functions)
-        try:
-            src = Path(node.path).read_text(encoding="utf-8", errors="replace")
-            referenced.update(re.findall(r"\b([a-zA-Z_]\w*)\b", src))
-        except OSError:
-            pass
+        all_test_funcs.update(nodes[t_name].functions)
 
     uncovered: List[str] = []
     for mod_name, node in nodes.items():
         if "test" in mod_name.lower():
             continue
+        language = node.language
         for func in node.functions:
             if func.startswith("_"):
-                continue  # private — not expected to have direct test coverage
-            if func not in referenced:
+                continue   # private — not expected to have a dedicated test
+
+            # Build the expected test-function name for this language
+            if language == "Go":
+                # Go convention: TestFuncName  (capitalise first letter)
+                expected = f"Test{func[0].upper()}{func[1:]}" if func else ""
+            else:
+                # Python / Rust / JS / TS convention: test_func_name
+                expected = f"test_{func}"
+
+            if expected not in all_test_funcs:
                 uncovered.append(f"{mod_name}.{func}")
 
     return uncovered
+
 
 
 # ===========================================================================
@@ -536,8 +782,8 @@ def _find_uncovered(
 def _classify_non_code(file: Path) -> NonPythonFile:
     """Categorise a non-code file into a human-readable bucket."""
     name_lower = file.name.lower()
-    ext = file.suffix.lower()
-    size_kb = round(file.stat().st_size / 1024, 2)
+    ext        = file.suffix.lower()
+    size_kb    = round(file.stat().st_size / 1024, 2)
 
     if name_lower in _DOCKER_NAMES or name_lower.startswith("dockerfile"):
         category = "docker"
@@ -546,7 +792,7 @@ def _classify_non_code(file: Path) -> NonPythonFile:
 
     return NonPythonFile(
         path=str(file),
-        ext=ext or file.name,  # for extension-less files like 'Dockerfile'
+        ext=ext or file.name,
         category=category,
         size_kb=size_kb,
     )
@@ -572,10 +818,10 @@ def _count_by_language(nodes: Dict[str, ModuleNode]) -> Dict[str, int]:
 
 
 # ===========================================================================
-# Graph Serialization
+# Graph Serialisation
 # ===========================================================================
 
 def _write_graph(graph: nx.DiGraph, output_path: Path) -> None:
-    """Serialize the NetworkX graph to JSON node-link format."""
+    """Serialise the NetworkX graph to JSON node-link format."""
     data = nx.node_link_data(graph)
     output_path.write_text(json.dumps(data, indent=2), encoding="utf-8")

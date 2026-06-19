@@ -1,32 +1,32 @@
 """
 tests/test_stage4_runners.py
 
-Stage 4 test suite: Test Runner + Test Stub Generator.
+Stage 4 test suite: Test Runner + Groq-powered Test Stub Generator.
 
 Strategy:
   - All subprocess calls are mocked — tests are hermetic.
   - Parser functions (_parse_pytest, _parse_cargo, _parse_go, _parse_jest) are
     called directly with synthetic output strings, making them fast and reliable.
-  - test_generator tests use tmp_path (pytest fixture) for real filesystem writes.
+  - generate_module_test_files tests use tmp_path (pytest fixture) for real
+    filesystem writes and a MagicMock groq_client for hermetic AI responses.
 
 Coverage:
-  _build_command         : command list per framework, fallback
-  _parse_pytest          : passed/failed/error/skipped, FAILED lines, dep errors,
-                           code_bugs classification
-  _parse_cargo           : summary line, FAILED lines, compile errors
-  _parse_go              : PASS/FAIL lines, build errors
-  _parse_jest            : Tests summary line, failed items
-  run_tests()            : subprocess mock (success, failure, timeout, OSError)
-  generate_test_stubs    : grouping, file content, idempotency, private-skip,
-                           empty-input guard
-  _make_stub             : stub function format
-  _build_file            : file header content
-  _module_name/_func_name: parsing helpers
-  generate_dep_stubs     : Python/Node/empty input, file naming, idempotency,
-                           import alias, content correctness
-  _make_python_dep_stub  : import statement, pytest.fail format
-  _make_node_dep_stub    : subprocess check format
-  _dep_to_import_name    : alias table, hyphen normalisation
+  _build_command              : command list per framework, fallback
+  _parse_pytest               : passed/failed/error/skipped, FAILED lines,
+                                dep errors, code_bugs classification
+  _parse_cargo                : summary line, FAILED lines, compile errors
+  _parse_go                   : PASS/FAIL lines, build errors
+  _parse_jest                 : Tests summary line, failed items
+  run_tests()                 : subprocess mock (success, failure, timeout,
+                                OSError)
+  generate_module_test_files  : guard cases (None KG, no uncovered, private),
+                                happy path (Groq mock), fallback on bad syntax,
+                                idempotency, stubs/ subdir placement,
+                                one-file-per-module grouping
+  _make_fallback              : per-language template correctness (Python, JS,
+                                Go, Rust)
+  _strip_fences               : fence removal (python, plain, none)
+  _validate_syntax            : valid/invalid Python, unknown language pass-through
 """
 
 from __future__ import annotations
@@ -40,15 +40,10 @@ import pytest
 
 from contribtriage.models import TestResult
 from contribtriage.runners.test_generator import (
-    _build_file,
-    _func_name,
-    _make_stub,
-    _module_name,
-    _make_python_dep_stub,
-    _make_node_dep_stub,
-    _dep_to_import_name,
-    generate_test_stubs,
-    generate_dep_stubs,
+    generate_module_test_files,
+    _make_fallback,
+    _strip_fences,
+    _validate_syntax,
 )
 from contribtriage.runners.test_runner import (
     _build_command,
@@ -383,314 +378,311 @@ class TestRunTests:
 
 
 # ===========================================================================
-# 7. _module_name() and _func_name()
+# 10. generate_module_test_files() — Groq-powered per-module stub generation
 # ===========================================================================
 
-class TestNameHelpers:
+class TestGenerateModuleTestFiles:
+    """Tests for the new AI-powered per-module test file generator."""
 
-    def test_module_name_simple(self):
-        assert _module_name("src.utils.parse_url") == "src.utils"
+    def _make_mock_groq(self, response_text: str):
+        """Build a minimal mock Groq client that returns *response_text*."""
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value.choices = [
+            MagicMock(message=MagicMock(content=response_text))
+        ]
+        return mock_client
 
-    def test_module_name_single_level(self):
-        assert _module_name("utils.my_func") == "utils"
+    def _make_kg(self, uncovered_funcs, module_nodes=None):
+        """Build a minimal KnowledgeGraph-like mock for testing."""
+        from contribtriage.models import KnowledgeGraph, ModuleNode
+        nodes = {}
+        if module_nodes:
+            nodes = module_nodes
+        elif uncovered_funcs:
+            # Auto-create a module node for each distinct module in uncovered
+            from collections import defaultdict
+            grouped = defaultdict(list)
+            for q in uncovered_funcs:
+                mod = q.rsplit(".", 1)[0] if "." in q else q
+                fn  = q.rsplit(".", 1)[-1] if "." in q else q
+                grouped[mod].append(fn)
+            for mod, fns in grouped.items():
+                nodes[mod] = ModuleNode(
+                    path=f"src/{mod}.py",
+                    module_name=mod,
+                    language="Python",
+                    functions=fns,
+                    classes=[],
+                    imports=["os"],
+                    todos=[],
+                )
+        return KnowledgeGraph(
+            nodes=nodes,
+            edges=[],
+            uncovered_funcs=uncovered_funcs,
+        )
 
-    def test_func_name_simple(self):
-        assert _func_name("src.utils.parse_url") == "parse_url"
+    # ── Guard cases ────────────────────────────────────────────────────────
 
-    def test_func_name_single_level(self):
-        assert _func_name("utils.my_func") == "my_func"
-
-
-# ===========================================================================
-# 8. _make_stub()
-# ===========================================================================
-
-class TestMakeStub:
-
-    def test_stub_is_valid_function_def(self):
-        stub = _make_stub("src.utils.parse_url")
-        assert "def test_parse_url():" in stub
-
-    def test_stub_contains_qualified_name(self):
-        stub = _make_stub("src.utils.parse_url")
-        assert "src.utils.parse_url" in stub
-
-    def test_stub_raises_not_implemented(self):
-        stub = _make_stub("src.utils.parse_url")
-        assert "NotImplementedError" in stub
-
-    def test_stub_has_docstring(self):
-        stub = _make_stub("mymod.myfunc")
-        assert '"""' in stub
-
-
-# ===========================================================================
-# 9. _build_file()
-# ===========================================================================
-
-class TestBuildFile:
-
-    def test_header_contains_module_name(self):
-        content = _build_file("src.utils", ["def test_foo(): pass\n"])
-        assert "src.utils" in content
-
-    def test_header_contains_stub_count(self):
-        stubs = ["def test_a(): pass\n", "def test_b(): pass\n"]
-        content = _build_file("mymod", stubs)
-        assert "2" in content  # stub count mentioned
-
-    def test_file_imports_pytest(self):
-        content = _build_file("mod", ["def test_x(): pass\n"])
-        assert "import pytest" in content
-
-
-# ===========================================================================
-# 10. generate_test_stubs() Integration
-# ===========================================================================
-
-class TestGenerateTestStubs:
+    def test_returns_empty_list_when_kg_is_none(self, tmp_path):
+        result = generate_module_test_files(
+            knowledge_graph=None,
+            project_meta=None,
+            groq_client=None,
+            repo_root=str(tmp_path),
+        )
+        assert result == []
 
     def test_returns_empty_list_when_no_uncovered(self, tmp_path):
-        result = generate_test_stubs([], str(tmp_path))
+        kg = self._make_kg([])
+        result = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=None,
+            repo_root=str(tmp_path),
+        )
         assert result == []
 
     def test_skips_private_functions(self, tmp_path):
-        result = generate_test_stubs(["mod._private_func"], str(tmp_path))
+        """Functions starting with _ should not appear in uncovered stubs."""
+        from contribtriage.models import KnowledgeGraph, ModuleNode
+        mod_node = ModuleNode(
+            path="src/utils.py",
+            module_name="src.utils",
+            language="Python",
+            functions=["_private"],
+            classes=[],
+            imports=[],
+            todos=[],
+        )
+        kg = KnowledgeGraph(
+            nodes={"src.utils": mod_node},
+            edges=[],
+            uncovered_funcs=["src.utils._private"],  # private — should be skipped
+        )
+        result = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=None,
+            repo_root=str(tmp_path),
+        )
         assert result == []
+
+    # ── Happy path: Groq returns valid content ─────────────────────────────
 
     def test_generates_file_for_uncovered_function(self, tmp_path):
-        paths = generate_test_stubs(["src.utils.parse_url"], str(tmp_path))
+        """With a mock Groq returning valid Python, one stub file is written."""
+        groq_content = (
+            "import pytest\n"
+            "import os\n\n"
+            "def test_my_func():\n"
+            "    raise NotImplementedError('stub')\n"
+        )
+        kg     = self._make_kg(["src.utils.my_func"])
+        client = self._make_mock_groq(groq_content)
+        paths  = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=client,
+            repo_root=str(tmp_path),
+        )
         assert len(paths) == 1
         assert Path(paths[0]).exists()
 
-    def test_generated_file_in_stubs_subdir(self, tmp_path):
-        paths = generate_test_stubs(["mod.my_func"], str(tmp_path))
+    def test_generated_file_is_in_stubs_subdir(self, tmp_path):
+        groq_content = "import pytest\n\ndef test_fn():\n    raise NotImplementedError()\n"
+        kg     = self._make_kg(["mod.fn"])
+        client = self._make_mock_groq(groq_content)
+        paths  = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=client,
+            repo_root=str(tmp_path),
+        )
         assert "stubs" in paths[0]
 
-    def test_file_contains_stub_function(self, tmp_path):
-        paths = generate_test_stubs(["src.utils.parse_url"], str(tmp_path))
-        content = Path(paths[0]).read_text()
-        assert "def test_parse_url" in content
-
-    def test_functions_from_same_module_in_one_file(self, tmp_path):
-        paths = generate_test_stubs(
-            ["utils.func_a", "utils.func_b"], str(tmp_path)
+    def test_generated_file_contains_function_stub(self, tmp_path):
+        """Groq output is written as-is when syntax is valid."""
+        groq_content = "import pytest\n\ndef test_parse_url():\n    raise NotImplementedError()\n"
+        kg     = self._make_kg(["src.utils.parse_url"])
+        client = self._make_mock_groq(groq_content)
+        paths  = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=client,
+            repo_root=str(tmp_path),
         )
-        assert len(paths) == 1  # grouped into one file
         content = Path(paths[0]).read_text()
-        assert "def test_func_a" in content
-        assert "def test_func_b" in content
+        assert "test_parse_url" in content
 
-    def test_functions_from_different_modules_in_separate_files(self, tmp_path):
-        paths = generate_test_stubs(
-            ["mod_a.func_x", "mod_b.func_y"], str(tmp_path)
+    def test_one_file_per_module(self, tmp_path):
+        """Two functions in the same module → one file."""
+        groq_content = (
+            "import pytest\n\n"
+            "def test_func_a():\n    raise NotImplementedError()\n\n"
+            "def test_func_b():\n    raise NotImplementedError()\n"
+        )
+        kg     = self._make_kg(["utils.func_a", "utils.func_b"])
+        client = self._make_mock_groq(groq_content)
+        paths  = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=client,
+            repo_root=str(tmp_path),
+        )
+        assert len(paths) == 1  # grouped into one file per module
+
+    def test_two_modules_two_files(self, tmp_path):
+        """Functions from different modules → separate files."""
+        from contribtriage.models import KnowledgeGraph, ModuleNode
+        groq_content = "import pytest\n\ndef test_fn():\n    raise NotImplementedError()\n"
+        nodes = {
+            "mod_a": ModuleNode("src/mod_a.py", "mod_a", "Python", [], ["fn_x"], [], []),
+            "mod_b": ModuleNode("src/mod_b.py", "mod_b", "Python", [], ["fn_y"], [], []),
+        }
+        kg = KnowledgeGraph(
+            nodes=nodes,
+            edges=[],
+            uncovered_funcs=["mod_a.fn_x", "mod_b.fn_y"],
+        )
+        client = self._make_mock_groq(groq_content)
+        paths  = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=client,
+            repo_root=str(tmp_path),
         )
         assert len(paths) == 2
+
+    # ── Fallback: Groq unavailable or returns bad syntax ──────────────────
+
+    def test_fallback_written_when_groq_client_none(self, tmp_path):
+        """No groq_client → fallback template written to disk."""
+        kg    = self._make_kg(["mod.my_func"])
+        paths = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=None,    # no client
+            repo_root=str(tmp_path),
+        )
+        assert len(paths) == 1
+        content = Path(paths[0]).read_text()
+        assert "NotImplementedError" in content or "ContribTriage" in content
+
+    def test_fallback_written_on_groq_syntax_error(self, tmp_path):
+        """Groq returns invalid Python → fallback with diagnostic comment."""
+        bad_python = "def invalid syntax !!!\n    oops"
+        kg     = self._make_kg(["mod.fn"])
+        client = self._make_mock_groq(bad_python)
+        paths  = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=client,
+            repo_root=str(tmp_path),
+        )
+        assert len(paths) == 1
+        content = Path(paths[0]).read_text()
+        # Fallback content should still be valid Python
+        import ast
+        ast.parse(content)   # should not raise
+
+    # ── Idempotency ───────────────────────────────────────────────────────
 
     def test_idempotent_does_not_overwrite_existing(self, tmp_path):
-        uncovered = ["utils.my_func"]
-        paths1 = generate_test_stubs(uncovered, str(tmp_path))
-        # Overwrite the file with custom content
-        Path(paths1[0]).write_text("# custom content", encoding="utf-8")
-        # Run again — should NOT overwrite
-        paths2 = generate_test_stubs(uncovered, str(tmp_path))
-        assert Path(paths2[0]).read_text() == "# custom content"
-
-    def test_creates_init_in_stubs_dir(self, tmp_path):
-        generate_test_stubs(["utils.my_func"], str(tmp_path))
-        init = tmp_path / "tests" / "stubs" / "__init__.py"
-        assert init.exists()
-
-    def test_generated_content_raises_not_implemented(self, tmp_path):
-        paths = generate_test_stubs(["utils.my_func"], str(tmp_path))
-        content = Path(paths[0]).read_text()
-        assert "NotImplementedError" in content
-
-
-# ===========================================================================
-# 11. _dep_to_import_name()
-# ===========================================================================
-
-class TestDepNameHelpers:
-
-    def test_plain_name_unchanged(self):
-        assert _dep_to_import_name("requests") == "requests"
-
-    def test_hyphen_replaced_by_underscore(self):
-        assert _dep_to_import_name("my-cool-lib") == "my_cool_lib"
-
-    def test_alias_pillow(self):
-        assert _dep_to_import_name("pillow") == "PIL"
-
-    def test_alias_scikit_learn(self):
-        assert _dep_to_import_name("scikit-learn") == "sklearn"
-
-    def test_alias_pyyaml(self):
-        assert _dep_to_import_name("pyyaml") == "yaml"
-
-    def test_alias_beautifulsoup4(self):
-        assert _dep_to_import_name("beautifulsoup4") == "bs4"
-
-    def test_alias_python_dotenv(self):
-        assert _dep_to_import_name("python-dotenv") == "dotenv"
-
-    def test_alias_lookup_is_case_insensitive(self):
-        # Alias table keys are lowercase; input may be mixed case
-        assert _dep_to_import_name("Pillow") == "PIL"
-        assert _dep_to_import_name("PYYAML") == "yaml"
-
-
-# ===========================================================================
-# 12. _make_python_dep_stub()
-# ===========================================================================
-
-class TestMakePythonDepStub:
-
-    def test_stub_has_function_def(self):
-        stub = _make_python_dep_stub("requests")
-        assert "def test_import_requests():" in stub
-
-    def test_stub_has_import_statement(self):
-        stub = _make_python_dep_stub("requests")
-        assert "import requests" in stub
-
-    def test_stub_has_pytest_fail(self):
-        stub = _make_python_dep_stub("requests")
-        assert "pytest.fail" in stub
-
-    def test_stub_uses_alias_for_pillow(self):
-        stub = _make_python_dep_stub("pillow")
-        assert "import PIL" in stub
-
-    def test_stub_uses_safe_name_for_hyphenated_dep(self):
-        """Hyphens in dep name must become underscores in the function name."""
-        stub = _make_python_dep_stub("python-dotenv")
-        assert "def test_import_python_dotenv" in stub
-
-    def test_stub_has_docstring(self):
-        stub = _make_python_dep_stub("requests")
-        assert '"""' in stub
-
-
-# ===========================================================================
-# 13. _make_node_dep_stub()
-# ===========================================================================
-
-class TestMakeNodeDepStub:
-
-    def test_stub_has_function_def(self):
-        stub = _make_node_dep_stub("axios")
-        assert "def test_import_axios():" in stub
-
-    def test_stub_runs_node_subprocess(self):
-        stub = _make_node_dep_stub("axios")
-        assert '"node"' in stub
-        assert "require" in stub
-
-    def test_stub_has_pytest_fail(self):
-        stub = _make_node_dep_stub("axios")
-        assert "pytest.fail" in stub
-
-    def test_scoped_package_safe_name(self):
-        """@scope/pkg names must produce a valid Python identifier for the def line.
-        The @ stays inside the require() call — that's intentional npm syntax."""
-        stub = _make_node_dep_stub("@scope/my-pkg")
-        # Function name must be a valid identifier (no @ or / characters)
-        first_line = stub.splitlines()[0]
-        assert "def test_import_" in first_line
-        assert "@" not in first_line
-        assert "/" not in first_line
-        # But the require() call MUST keep the original package name
-        assert "require('@scope/my-pkg')" in stub
-
-
-# ===========================================================================
-# 14. generate_dep_stubs() Integration
-# ===========================================================================
-
-class TestGenerateDepStubs:
-
-    # Shared fixture helpers
-    _PY_DEPS = ["requests", "flask"]
-    _PY_ECO  = {"requests": "python", "flask": "python"}
-    _NODE_DEPS = ["axios", "express"]
-    _NODE_ECO  = {"axios": "node", "express": "node"}
-
-    def test_returns_empty_list_when_no_deps(self, tmp_path):
-        result = generate_dep_stubs([], {}, str(tmp_path))
-        assert result == []
-
-    def test_generates_python_dep_file(self, tmp_path):
-        paths = generate_dep_stubs(self._PY_DEPS, self._PY_ECO, str(tmp_path))
-        assert len(paths) == 1
-        assert Path(paths[0]).exists()
-
-    def test_python_dep_file_has_correct_name(self, tmp_path):
-        paths = generate_dep_stubs(self._PY_DEPS, self._PY_ECO, str(tmp_path))
-        assert "test_deps_python_stubs.py" in paths[0]
-
-    def test_generates_node_dep_file(self, tmp_path):
-        paths = generate_dep_stubs(self._NODE_DEPS, self._NODE_ECO, str(tmp_path))
-        assert len(paths) == 1
-        assert "test_deps_node_stubs.py" in paths[0]
-
-    def test_generates_both_files_for_mixed_repo(self, tmp_path):
-        deps = self._PY_DEPS + self._NODE_DEPS
-        eco  = {**self._PY_ECO, **self._NODE_ECO}
-        paths = generate_dep_stubs(deps, eco, str(tmp_path))
-        assert len(paths) == 2
-
-    def test_rust_and_go_deps_are_skipped(self, tmp_path):
-        deps = ["serde", "tokio"]
-        eco  = {"serde": "rust", "tokio": "rust"}
-        paths = generate_dep_stubs(deps, eco, str(tmp_path))
-        assert paths == []
-
-    def test_python_file_contains_import_test_per_dep(self, tmp_path):
-        paths = generate_dep_stubs(self._PY_DEPS, self._PY_ECO, str(tmp_path))
-        content = Path(paths[0]).read_text()
-        assert "def test_import_requests" in content
-        assert "def test_import_flask" in content
-
-    def test_node_file_contains_require_test_per_dep(self, tmp_path):
-        paths = generate_dep_stubs(self._NODE_DEPS, self._NODE_ECO, str(tmp_path))
-        content = Path(paths[0]).read_text()
-        assert "require" in content
-        assert "def test_import_axios" in content
-
-    def test_python_file_imports_pytest(self, tmp_path):
-        paths = generate_dep_stubs(self._PY_DEPS, self._PY_ECO, str(tmp_path))
-        content = Path(paths[0]).read_text()
-        assert "import pytest" in content
-
-    def test_file_in_stubs_subdir(self, tmp_path):
-        paths = generate_dep_stubs(self._PY_DEPS, self._PY_ECO, str(tmp_path))
-        assert "stubs" in paths[0]
-
-    def test_creates_init_file_in_stubs_dir(self, tmp_path):
-        generate_dep_stubs(self._PY_DEPS, self._PY_ECO, str(tmp_path))
-        init = tmp_path / "tests" / "stubs" / "__init__.py"
-        assert init.exists()
-
-    def test_idempotent_python_file(self, tmp_path):
-        """Calling twice must NOT overwrite the first file."""
-        paths1 = generate_dep_stubs(self._PY_DEPS, self._PY_ECO, str(tmp_path))
+        groq_content = "import pytest\n\ndef test_fn():\n    raise NotImplementedError()\n"
+        kg     = self._make_kg(["utils.my_func"])
+        client = self._make_mock_groq(groq_content)
+        paths1 = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=client,
+            repo_root=str(tmp_path),
+        )
+        # Overwrite with custom sentinel
         Path(paths1[0]).write_text("# sentinel", encoding="utf-8")
-        paths2 = generate_dep_stubs(self._PY_DEPS, self._PY_ECO, str(tmp_path))
+        # Run again — must NOT overwrite
+        paths2 = generate_module_test_files(
+            knowledge_graph=kg,
+            project_meta=None,
+            groq_client=client,
+            repo_root=str(tmp_path),
+        )
         assert Path(paths2[0]).read_text() == "# sentinel"
 
-    def test_uses_import_alias_in_generated_test(self, tmp_path):
-        """Pillow's generated import should be 'PIL', not 'pillow'."""
-        deps = ["pillow"]
-        eco  = {"pillow": "python"}
-        paths = generate_dep_stubs(deps, eco, str(tmp_path))
-        content = Path(paths[0]).read_text()
-        assert "import PIL" in content
-        assert "import pillow" not in content
 
-    def test_dep_with_unknown_ecosystem_skipped(self, tmp_path):
-        """A dep with ecosystem='unknown' should produce no files."""
-        paths = generate_dep_stubs(
-            ["some-tool"], {"some-tool": "unknown"}, str(tmp_path)
+# ===========================================================================
+# 11. _make_fallback() — language-specific fallback templates
+# ===========================================================================
+
+class TestMakeFallback:
+    """Tests for the per-language fallback template generator."""
+
+    def _node(self, language="Python"):
+        from contribtriage.models import ModuleNode
+        return ModuleNode(
+            path=f"src/mod.{'py' if language == 'Python' else 'js'}",
+            module_name="mod",
+            language=language,
+            functions=["my_func"],
+            classes=[],
+            imports=[],
+            todos=[],
         )
-        assert paths == []
+
+    def test_python_fallback_is_valid_python(self):
+        import ast
+        content = _make_fallback(self._node("Python"), ["my_func"])
+        ast.parse(content)   # must not raise
+
+    def test_python_fallback_has_not_implemented(self):
+        content = _make_fallback(self._node("Python"), ["my_func"])
+        assert "NotImplementedError" in content
+
+    def test_js_fallback_has_jest_describe(self):
+        content = _make_fallback(self._node("JavaScript"), ["fn"])
+        assert "describe" in content
+        assert "throw new Error" in content
+
+    def test_go_fallback_has_testing_skip(self):
+        content = _make_fallback(self._node("Go"), ["MyFunc"])
+        assert "t.Skip" in content
+        assert "testing" in content
+
+    def test_rust_fallback_has_cfg_test(self):
+        content = _make_fallback(self._node("Rust"), ["my_fn"])
+        assert "#[cfg(test)]" in content
+        assert "panic!" in content
+
+
+# ===========================================================================
+# 12. _strip_fences() and _validate_syntax()
+# ===========================================================================
+
+class TestUtilHelpers:
+
+    def test_strip_fences_removes_python_fence(self):
+        code = "```python\nimport os\n```"
+        assert _strip_fences(code) == "import os"
+
+    def test_strip_fences_removes_plain_fence(self):
+        code = "```\nimport os\n```"
+        assert _strip_fences(code) == "import os"
+
+    def test_strip_fences_no_fences_unchanged(self):
+        code = "import os\ndef foo(): pass"
+        assert _strip_fences(code) == code
+
+    def test_validate_syntax_valid_python(self):
+        ok, msg = _validate_syntax("import os\ndef foo(): pass\n", "Python")
+        assert ok is True
+        assert msg == ""
+
+    def test_validate_syntax_invalid_python(self):
+        ok, msg = _validate_syntax("def invalid syntax !!!", "Python")
+        assert ok is False
+        assert msg != ""
+
+    def test_validate_syntax_unknown_language_passes(self):
+        """Unknown language should optimistically return True."""
+        ok, _ = _validate_syntax("any content at all", "COBOL")
+        assert ok is True

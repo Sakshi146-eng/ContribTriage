@@ -38,6 +38,18 @@ dependencies = [
 
     # ── Rich terminal output — progress bars, panels, colored diffs ───────
     "rich>=13.0.0",
+
+    # ── Tree-sitter universal AST parsing (Stage 1 — replaces all regex) ──
+    # Core bindings: 0.23.x is the last series supporting Python 3.9
+    "tree-sitter>=0.21,<0.24",
+    # Language grammars (pre-compiled wheels — zero compilation overhead)
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    # Rust grammar: pinned <0.24 because tree-sitter 0.23 supports ABI 13-14 only;
+    # tree-sitter-rust 0.24+ requires ABI 15 (needs tree-sitter>=0.24, Python>=3.10)
+    "tree-sitter-rust<0.24",
+    "tree-sitter-go",
 ]
 
 [project.optional-dependencies]

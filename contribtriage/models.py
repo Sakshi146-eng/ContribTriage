@@ -351,6 +351,9 @@ class LangGraphState(TypedDict, total=False):
     max_retries: int                        # --max-retries ceiling
     persist: bool                           # --persist: use SqliteSaver
 
+    # ── LLM clients (injected by CLI, passed through state) ──────────────
+    groq_client: Any                        # Initialised groq.Groq() instance
+
     # ── Stage 1 outputs ───────────────────────────────────────────────────
     knowledge_graph: KnowledgeGraph         # Populated by lexical_parser
     vector_store_path: str                  # Path to .contribtriage_qdrant/
@@ -366,6 +369,7 @@ class LangGraphState(TypedDict, total=False):
     terminal_log_history: Annotated[List[str], operator.add]
     groq_analysis: str                      # Latest Groq diagnosis text
     failure_category: str                   # 'code_bug'|'system_dep'|'app_dep'|''
+    fix_command: str                        # LLM-generated shell command to run
 
     # ── Healing loop bookkeeping ──────────────────────────────────────────
     failed_test_ids: List[str]              # IDs for selective rerun
@@ -377,3 +381,4 @@ class LangGraphState(TypedDict, total=False):
 
     # ── Final output ──────────────────────────────────────────────────────
     final_report_path: str                  # Absolute path to SETUP_DIAGNOSTICS.md
+
