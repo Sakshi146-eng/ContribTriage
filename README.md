@@ -173,6 +173,3 @@ pytest
 pytest --cov=contribtriage --cov-report=term-missing
 ```
 
-## 🔹 License
-
-MIT — see `pyproject.toml` for details.
