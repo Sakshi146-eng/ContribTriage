@@ -1,6 +1,6 @@
 # ContribTriage
 
-🚀 **ContribTriage** is a CLI tool that points at any cloned repository and produces a **`SETUP_DIAGNOSTICS.md`** report that helps new contributors get their environment running fast. It is powered by a **LangGraph StateGraph** pipeline that combines Tree-sitter AST parsing, a Qdrant vector store, Groq Llama-3 real-time analysis, and Gemini 2.5 Flash report synthesis — automating everything from environment auditing to AI-generated onboarding guides.
+**ContribTriage** is a CLI tool that points at any cloned repository and produces a **`SETUP_DIAGNOSTICS.md`** report that helps new contributors get their environment running fast. It is powered by a **LangGraph StateGraph** pipeline that combines Tree-sitter AST parsing, a Qdrant vector store, Groq Llama-3 real-time analysis, and Gemini 2.5 Flash report synthesis — automating everything from environment auditing to AI-generated onboarding guides.
 
 ## 🔹 Key Features
 
@@ -172,4 +172,3 @@ contribtriage --repo-path ./next.js --max-retries 5 --persist
 pytest
 pytest --cov=contribtriage --cov-report=term-missing
 ```
-
