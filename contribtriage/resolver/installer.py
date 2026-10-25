@@ -24,15 +24,93 @@ Return contract
 
 from __future__ import annotations
 
+import os
+import shlex
+import shutil
 import subprocess
 from typing import Tuple
 
 from rich.console import Console
 from rich.panel import Panel
 
+
 console = Console()
 
 _TIMEOUT = 120  # seconds
+
+# First word -> allowed sub-commands (anything else is refused)
+_ALLOWED = {
+    "pip": {"install"}, "pip3": {"install"},
+    "uv": {"pip", "add", "sync"},
+    "npm": {"install", "i", "ci"}, "pnpm": {"add", "install", "i"},
+    "yarn": {"add", "install"},
+    "cargo": {"add", "install", "fetch"},
+    "go": {"get", "mod"},
+    "docker": {"run", "compose"},
+    "brew": {"install"}, "winget": {"install"}, "choco": {"install"},
+}
+_CHAIN_TOKENS = {"&&", "||", ";", "|", ">", ">>", "<", "&"}
+_BAD_FLAGS = {
+    "--index-url", "--extra-index-url", "--trusted-host", "--registry",
+    "--privileged", "--cap-add", "--volume", "--mount",
+}
+_PIP_TOOLS = {"pip", "pip3", "uv", "python", "python3", "py"}
+
+
+def _split(cmd: str) -> list:
+    """Split a command string into words without using a shell."""
+    if os.name == "nt":
+        parts = shlex.split(cmd, posix=False)
+        return [p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'" else p for p in parts]
+    return shlex.split(cmd)
+
+
+def validate_fix_command(fix_command: str) -> Tuple[bool, str]:
+    """Return (ok, reason). Only known install-type commands are allowed."""
+    raw = fix_command.strip()
+    if not raw:
+        return False, "empty command"
+    if "\n" in raw or "\r" in raw or "`" in raw or "$(" in raw:
+        return False, "multi-line commands and shell substitution are not allowed"
+    try:
+        args = _split(raw)
+    except ValueError as exc:
+        return False, f"could not parse command ({exc})"
+    if not args:
+        return False, "empty command"
+    if args[0] == "sudo":
+        return False, "needs admin rights - please run it yourself in a terminal"
+    if any(a in _CHAIN_TOKENS for a in args):
+        return False, "command chaining or redirection is not allowed (one command only)"
+
+    tool = args[0].lower()
+    if tool in ("python", "python3", "py"):
+        if args[1:4] != ["-m", "pip", "install"]:
+            return False, "only `python -m pip install` is allowed"
+    else:
+        if tool not in _ALLOWED or len(args) < 2:
+            return False, f"'{args[0]}' is not on the allowed list"
+        sub, rest = args[1], args[2:]
+        if sub not in _ALLOWED[tool]:
+            return False, f"'{tool} {sub}' is not allowed"
+        if tool == "uv" and sub == "pip" and (not rest or rest[0] != "install"):
+            return False, "only `uv pip install` is allowed"
+        if tool == "go" and sub == "mod" and (not rest or rest[0] not in ("download", "tidy")):
+            return False, "only `go mod download|tidy` is allowed"
+        if tool == "docker" and sub == "compose" and (not rest or rest[0] != "up"):
+            return False, "only `docker compose up` is allowed"
+
+    bad = set(_BAD_FLAGS)
+    if tool in _PIP_TOOLS:
+        bad.add("-i")
+    if tool == "docker":
+        bad.add("-v")
+    for a in args[1:]:
+        if a.split("=")[0] in bad:
+            return False, f"flag '{a}' is not allowed"
+        if "://" in a or a.startswith("git+"):
+            return False, "installing from a URL is not allowed"
+    return True, ""
 
 
 # ===========================================================================
@@ -57,6 +135,12 @@ def run_fix_command(
     """
     if not fix_command or not fix_command.strip():
         return False, "[ContribTriage] No fix command provided.", False
+    
+    ok, reason = validate_fix_command(fix_command)
+    if not ok:
+        msg = f"[ContribTriage] Blocked command: {reason}\nCommand was: {fix_command}"
+        console.print(f"[red]  ✗ {msg}[/red]")
+        return False, msg, False
 
     _show_command_panel(fix_command)
 
@@ -92,8 +176,8 @@ def _get_consent(fix_command: str, yes_flag: bool) -> bool:
         return True
 
     try:
-        answer = input("  Run this command? [Y/n]  ").strip().lower()
-        return answer in ("", "y", "yes")
+        answer = input("  Run this command? [y/N]  ").strip().lower()
+        return answer in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
         # Non-interactive context (CI) — treat as declined
         console.print("[dim]  Non-interactive context — treating as declined.[/dim]")
@@ -116,9 +200,20 @@ def _execute(fix_command: str, repo_root: str) -> Tuple[bool, str, bool]:
     """
     console.print(f"[cyan]  → Executing: {fix_command}[/cyan]")
     try:
+        # proc = subprocess.run(
+        #     fix_command,
+        #     shell=True,
+        #     cwd=repo_root,
+        #     capture_output=True,
+        #     text=True,
+        #     timeout=_TIMEOUT,
+        # )
+        args = _split(fix_command)
+        resolved = shutil.which(args[0])      # finds npm.cmd etc. on Windows
+        if resolved:
+            args[0] = resolved
         proc = subprocess.run(
-            fix_command,
-            shell=True,
+            args,
             cwd=repo_root,
             capture_output=True,
             text=True,

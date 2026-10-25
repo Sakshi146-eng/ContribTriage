@@ -76,8 +76,15 @@ class ModuleNode:
     classes: List[str] = field(default_factory=list)
     functions: List[str] = field(default_factory=list)
     imports: List[str] = field(default_factory=list)
+    # todos: List[str] = field(default_factory=list)
+    # docstring: Optional[str] = None
     todos: List[str] = field(default_factory=list)
     docstring: Optional[str] = None
+    # (name, start_line, end_line), 1-based and inclusive. Code is read from disk on demand.
+    func_spans: List[tuple] = field(default_factory=list)
+    class_spans: List[tuple] = field(default_factory=list)
+    # (line_number, "TAG: text"), the same TODOs as `todos`, with locations
+    todo_locations: List[tuple] = field(default_factory=list)
 
 
 @dataclass

@@ -66,10 +66,12 @@ from rich.console import Console
 
 from contribtriage.ingestion.lexical_parser import KnowledgeGraph
 from contribtriage.models import ModuleNode, ProjectMeta
+import os
 
 console = Console()
 
 _STUB_SUBDIR = "stubs"
+_GROQ_MODEL = os.getenv("CONTRIBTRIAGE_GROQ_MODEL", "openai/gpt-oss-120b")
 
 # Language label → file extension for generated test files
 _TEST_EXTENSION: Dict[str, str] = {
@@ -150,6 +152,7 @@ def generate_module_test_files(
 
         path = _generate_one_module_file(
             module_node=module_node,
+            module_name=module_name,
             func_names=func_names,
             project_meta=project_meta,
             groq_client=groq_client,
@@ -171,6 +174,7 @@ def generate_module_test_files(
 
 def _generate_one_module_file(
     module_node: ModuleNode,
+    module_name: str,
     func_names: List[str],
     project_meta: Optional[ProjectMeta],
     groq_client: Any,
@@ -192,7 +196,7 @@ def _generate_one_module_file(
         return str(file_path)
 
     # Build Groq prompt
-    prompt = _build_prompt(module_node, func_names, project_meta)
+    prompt = _build_prompt(module_node, module_name, func_names, project_meta)
 
     # Call Groq
     content = _call_groq(groq_client, prompt, module_node)
@@ -202,6 +206,7 @@ def _generate_one_module_file(
 
     # Strip accidental markdown fences
     content = _strip_fences(content)
+    content = _ensure_pytest_import(content, language)
 
     # Validate syntax
     valid, error_msg = _validate_syntax(content, language)
@@ -228,6 +233,7 @@ def _generate_one_module_file(
 
 def _build_prompt(
     module_node: ModuleNode,
+    module_name: str,
     func_names: List[str],
     project_meta: Optional[ProjectMeta],
 ) -> str:
@@ -246,6 +252,13 @@ def _build_prompt(
 
     format_rules   = _format_rules(language, framework)
 
+    import_rule = (
+        f"   - The source module itself, imported EXACTLY as `import {module_name}` "
+        f"(this is the full dotted path from the repo root; do not shorten it)\n"
+        if language == "Python"
+        else "   - The source module itself\n"
+    )
+
     return (
         f"You are an expert {language} developer. "
         f"Generate a complete, syntactically valid test file.\n\n"
@@ -257,7 +270,7 @@ def _build_prompt(
         f"Project declared dependencies: {dep_str}\n\n"
         f"STRICT REQUIREMENTS:\n"
         f"1. At the VERY TOP of the file, write import/require/use statements for:\n"
-        f"   - The source module itself\n"
+        f"{import_rule}"
         f"   - All third-party dependencies it uses\n"
         f"   These imports serve as dependency health checks — a missing package "
         f"will cause an immediate failure before any test runs.\n"
@@ -270,25 +283,46 @@ def _build_prompt(
 
 def _format_rules(language: str, framework: str) -> str:
     """Return language/framework-specific formatting instructions."""
+    # if language == "Python":
+    #     return (
+    #         "Use pytest format: `def test_<name>():` with "
+    #         "`raise NotImplementedError('<name> has no test coverage')`"
+    #     )
+    # if language in ("JavaScript", "JavaScript/React"):
+    #     return (
+    #         "Use Jest format: `describe('<module>', () => { "
+    #         "test('<name>', () => { throw new Error('<name> needs a test'); }); })`"
+    #     )
+    # if language in ("TypeScript", "TypeScript/React"):
+    #     return (
+    #         "Use Jest/TypeScript format with `describe`/`test` blocks. "
+    #         "Throw an Error in each stub body."
+    #     )
+    # if language == "Rust":
+    #     return (
+    #         "Use Rust's `#[cfg(test)] mod tests { #[test] fn test_<name>() { "
+    #         "panic!(\"<name> has no test coverage\"); } }` format."
+    #     )
     if language == "Python":
         return (
-            "Use pytest format: `def test_<name>():` with "
-            "`raise NotImplementedError('<name> has no test coverage')`"
+            "Use pytest format. Start the file with `import pytest`. Each stub must be "
+            "`def test_<name>():` whose ONLY statement is "
+            "`pytest.skip('<name> has no test coverage')`"
         )
     if language in ("JavaScript", "JavaScript/React"):
         return (
             "Use Jest format: `describe('<module>', () => { "
-            "test('<name>', () => { throw new Error('<name> needs a test'); }); })`"
+            "test.skip('<name>', () => {}); })`"
         )
     if language in ("TypeScript", "TypeScript/React"):
         return (
-            "Use Jest/TypeScript format with `describe`/`test` blocks. "
-            "Throw an Error in each stub body."
+            "Use Jest/TypeScript format with a `describe` block and "
+            "`test.skip('<name>', () => {})` for each stub."
         )
     if language == "Rust":
         return (
-            "Use Rust's `#[cfg(test)] mod tests { #[test] fn test_<name>() { "
-            "panic!(\"<name> has no test coverage\"); } }` format."
+            "Use Rust's `#[cfg(test)] mod tests { #[test] "
+            "#[ignore = \"<name> has no test coverage\"] fn test_<name>() {} }` format."
         )
     if language == "Go":
         return (
@@ -322,10 +356,10 @@ def _call_groq(groq_client: Any, prompt: str, module_node: ModuleNode) -> Option
         return None
     try:
         response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=_GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=2048,
+            max_tokens=4096,
         )
         return response.choices[0].message.content
     except Exception as exc:  # noqa: BLE001
@@ -426,10 +460,16 @@ def _make_fallback(
                  "ContribTriage: fallback stub placeholder"
 
     if language == "Python":
+        # stubs = "\n\n".join(
+        #     f"def test_{fn}():\n"
+        #     f'    """Fallback stub for {fn} — please implement."""\n'
+        #     f'    raise NotImplementedError("{fn} has no test coverage.")'
+        #     for fn in func_names
+        # )
         stubs = "\n\n".join(
             f"def test_{fn}():\n"
             f'    """Fallback stub for {fn} — please implement."""\n'
-            f'    raise NotImplementedError("{fn} has no test coverage.")'
+            f'    pytest.skip("{fn} has no test coverage.")'
             for fn in func_names
         )
         return (
@@ -438,9 +478,15 @@ def _make_fallback(
         )
 
     if language in ("JavaScript", "JavaScript/React"):
+        # stubs = "\n\n".join(
+        #     f"  test('{fn}', () => {{\n"
+        #     f"    throw new Error('{fn} has no test coverage.');\n"
+        #     f"  }});"
+        #     for fn in func_names
+        # )
         stubs = "\n\n".join(
-            f"  test('{fn}', () => {{\n"
-            f"    throw new Error('{fn} has no test coverage.');\n"
+            f"  test.skip('{fn}', () => {{\n"
+            f"    // no test coverage yet\n"
             f"  }});"
             for fn in func_names
         )
@@ -450,9 +496,15 @@ def _make_fallback(
         )
 
     if language in ("TypeScript", "TypeScript/React"):
+        # stubs = "\n\n".join(
+        #     f"  test('{fn}', (): void => {{\n"
+        #     f"    throw new Error('{fn} has no test coverage.');\n"
+        #     f"  }});"
+        #     for fn in func_names
+        # )
         stubs = "\n\n".join(
-            f"  test('{fn}', (): void => {{\n"
-            f"    throw new Error('{fn} has no test coverage.');\n"
+            f"  test.skip('{fn}', (): void => {{\n"
+            f"    // no test coverage yet\n"
             f"  }});"
             for fn in func_names
         )
@@ -463,7 +515,8 @@ def _make_fallback(
 
     if language == "Go":
         stubs = "\n\n".join(
-            f"func Test{fn.capitalize()}(t *testing.T) {{\n"
+            # f"func Test{fn.capitalize()}(t *testing.T) {{\n"
+            f"func Test{fn[0].upper() + fn[1:]}(t *testing.T) {{\n"
             f'    t.Skip("{fn} has no test coverage.")\n'
             f"}}"
             for fn in func_names
@@ -474,10 +527,14 @@ def _make_fallback(
         )
 
     if language == "Rust":
+        # stubs = "\n\n".join(
+        #     f"    #[test]\n    fn test_{fn}() {{\n"
+        #     f'        panic!("{fn} has no test coverage.");\n'
+        #     f"    }}"
+        #     for fn in func_names
+        # )
         stubs = "\n\n".join(
-            f"    #[test]\n    fn test_{fn}() {{\n"
-            f'        panic!("{fn} has no test coverage.");\n'
-            f"    }}"
+            f'    #[test]\n    #[ignore = "{fn} has no test coverage"]\n    fn test_{fn}() {{}}'
             for fn in func_names
         )
         return (
@@ -490,7 +547,7 @@ def _make_fallback(
         f"# {header_msg}\n# Uncovered functions: {func_list}\n\n"
         f"import pytest\n\n"
         f"def test_placeholder():\n"
-        f'    raise NotImplementedError("Stub: {func_list}")\n'
+        f'    pytest.skip("Stub: {func_list}")")\n'
     )
 
 
@@ -504,3 +561,14 @@ def _strip_fences(content: str) -> str:
     content = re.sub(r"^```[a-zA-Z]*\n?", "", content.lstrip(), flags=re.MULTILINE)
     content = re.sub(r"^```\s*$", "", content, flags=re.MULTILINE)
     return content.strip()
+
+def _ensure_pytest_import(content: str, language: str) -> str:
+    """Groq sometimes forgets `import pytest`; without it pytest.skip raises NameError."""
+    if (
+        language == "Python"
+        and "pytest.skip" in content
+        and "from __future__" not in content
+        and not re.search(r"^\s*(import pytest|from pytest import)", content, re.MULTILINE)
+    ):
+        return "import pytest\n" + content
+    return content

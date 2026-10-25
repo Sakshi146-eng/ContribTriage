@@ -124,11 +124,26 @@ def _build_report_prompt(state: "LangGraphState") -> str:
     ) if dep_findings else "  No dependency actions taken."
 
     # KG summary
+    # kg_text = (
+    #     f"Modules: {len(getattr(kg, 'modules', {}))}\n"
+    #     f"Functions: {sum(len(m.functions) for m in getattr(kg, 'modules', {}).values() if hasattr(m, 'functions'))}\n"
+    #     f"Languages: {', '.join(set(getattr(m, 'language', 'python') for m in getattr(kg, 'modules', {}).values()))}"
+    # ) if kg else "Knowledge graph not available."
     kg_text = (
-        f"Modules: {len(getattr(kg, 'modules', {}))}\n"
-        f"Functions: {sum(len(m.functions) for m in getattr(kg, 'modules', {}).values() if hasattr(m, 'functions'))}\n"
-        f"Languages: {', '.join(set(getattr(m, 'language', 'python') for m in getattr(kg, 'modules', {}).values()))}"
+        f"Modules: {len(kg.nodes)}\n"
+        f"Functions: {sum(len(m.functions) for m in kg.nodes.values())}\n"
+        f"Languages: {', '.join(sorted(kg.language_summary)) or 'unknown'}"
     ) if kg else "Knowledge graph not available."
+
+    repo_root = getattr(project_meta, "repo_root", "") or ""
+    todo_items = []
+    if kg:
+        for n in kg.nodes.values():
+            rel = os.path.relpath(n.path, repo_root) if repo_root else n.path
+            for line_no, text in n.todo_locations:
+                todo_items.append(f"{rel}:{line_no}: {text}")
+    todo_text = "\n".join(todo_items[:30]) or "None found."
+    uncovered_text = "\n".join(kg.uncovered_funcs[:30]) if kg and kg.uncovered_funcs else "None."
 
     # Test summary
     test_text = (
@@ -152,6 +167,12 @@ collected. Generate the complete markdown document now.
 
 === KNOWLEDGE GRAPH ===
 {kg_text}
+
+=== TODO / FIXME COMMENTS (file:line: text) ===
+{todo_text}
+
+=== UNCOVERED PUBLIC FUNCTIONS (module.function) ===
+{uncovered_text}
 
 === DEPENDENCY RESOLUTION LOG ===
 {dep_text}
@@ -194,6 +215,7 @@ Generate SETUP_DIAGNOSTICS.md with these EXACT sections:
    - For each, write the skeleton test function the contributor should add
    - Label this: [ ] Good First Issue / Test Coverage
 
+Use ONLY the data provided above. If a section has no data, say so instead of inventing entries.
 Format as clean, copy-pasteable GitHub Markdown. Use tables, code blocks, and checkboxes.
 Be specific — include actual test IDs, actual function names, actual file paths from the data.
 For Pathway A, ALWAYS include the corrected code suggestion even if it requires reasoning from the traceback.

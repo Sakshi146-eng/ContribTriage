@@ -46,7 +46,10 @@ from rich.console import Console
 
 console = Console()
 
-_MODEL = "llama-3.3-70b-versatile"
+# _MODEL = "llama-3.3-70b-versatile"
+
+# Groq retired llama-3.3-70b-versatile on 16 Aug 2026; override with the env var if needed.
+_MODEL = os.getenv("CONTRIBTRIAGE_GROQ_MODEL", "openai/gpt-oss-120b")
 
 _SAFE_FALLBACK: Dict[str, Any] = {
     "failure_category": "code_bug",
@@ -176,7 +179,8 @@ def analyze_failure(
             ],
             response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=512,
+            # max_tokens=512,
+            max_tokens=2048,
         )
         raw_json = response.choices[0].message.content
         result   = _parse_response(raw_json)
@@ -185,7 +189,11 @@ def analyze_failure(
         console.print(
             f"[yellow]  ⚠ Groq call failed ({exc}) — defaulting to code_bug[/yellow]"
         )
-        return dict(_SAFE_FALLBACK)
+        fallback = dict(_SAFE_FALLBACK)
+        fallback["reasoning"] = (
+            f"Groq call failed ({type(exc).__name__}) — treating as code_bug so no command is run."
+        )
+        return fallback
 
     category = result.get("failure_category", "code_bug")
     icon = {"code_bug": "🐛", "system_dep": "🔧", "app_dep": "📦"}.get(category, "❓")

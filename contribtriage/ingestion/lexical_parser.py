@@ -347,6 +347,11 @@ def _collect_all_files(root: Path) -> List[Path]:
             for part in path.parts
         ):
             continue
+        # Never treat ContribTriage's own output as part of the repo:
+        # the generated stubs and the previous report.
+        rel_parts = path.relative_to(root).parts
+        if rel_parts[:2] == ("tests", "stubs") or path.name == "SETUP_DIAGNOSTICS.md":
+            continue
         files.append(path)
     return sorted(files)
 
@@ -407,8 +412,13 @@ def _parse_file(
     parser = Parser(cfg.ts_language)
     tree   = parser.parse(source_bytes)
 
+    # functions = _query_names(cfg.ts_language, tree, cfg.func_queries)
+    # classes   = _query_names(cfg.ts_language, tree, cfg.class_queries)
     functions = _query_names(cfg.ts_language, tree, cfg.func_queries)
-    classes   = _query_names(cfg.ts_language, tree, cfg.class_queries)
+    classes = _query_names(cfg.ts_language, tree, cfg.class_queries)
+    func_spans = _query_spans(cfg.ts_language, tree, cfg.func_queries)
+    class_spans = _query_spans(cfg.ts_language, tree, cfg.class_queries)
+    todo_locations = _extract_todo_locations(cfg.todo_pattern, source_text)
     imports   = _extract_imports(cfg, tree, source_text)
     todos     = _extract_todos(cfg.todo_pattern, source_text)
     docstring = _extract_docstring(source_bytes, cfg.language)
@@ -422,6 +432,9 @@ def _parse_file(
         imports=imports,
         todos=todos,
         docstring=docstring,
+        func_spans=func_spans,
+        class_spans=class_spans,
+        todo_locations=todo_locations
     )
 
 
@@ -450,6 +463,36 @@ def _query_names(
             pass
     return results
 
+def _query_spans(language: Language, tree, query_strings: List[str]) -> List[tuple]:
+    """Like _query_names, but returns (name, start_line, end_line), 1-based."""
+    spans: List[tuple] = []
+    seen: Set[tuple] = set()
+    for qs in query_strings:
+        if not qs.strip():
+            continue
+        try:
+            q = language.query(qs)
+            for node in q.captures(tree.root_node).get("name", []):
+                name = node.text.decode("utf-8", errors="replace")
+                defn = node.parent or node          # the whole function/class node
+                start = defn.start_point[0] + 1
+                end = defn.end_point[0] + 1
+                if name and (name, start) not in seen:
+                    seen.add((name, start))
+                    spans.append((name, start, end))
+        except Exception:  # noqa: BLE001
+            pass
+    return spans
+
+
+def _extract_todo_locations(pattern: re.Pattern, source_text: str) -> List[tuple]:
+    """Return (line_number, 'TAG: text') for each TODO/FIXME/BUG/HACK comment."""
+    out: List[tuple] = []
+    for i, line in enumerate(source_text.splitlines(), start=1):
+        m = pattern.search(line)
+        if m:
+            out.append((i, f"{m.group(1).upper()}: {m.group(2).strip()}"))
+    return out
 
 def _extract_imports(
     cfg: LanguageConfig,
@@ -714,6 +757,8 @@ def _node_to_attrs(node: ModuleNode) -> dict:
         "classes":    node.classes,
         "functions":  node.functions,
         "todo_count": len(node.todos),
+        "func_spans": node.func_spans,
+        "class_spans": node.class_spans,
     }
 
 

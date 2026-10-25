@@ -51,7 +51,7 @@ console = Console()
 # ===========================================================================
 
 _COMMANDS: dict = {
-    "pytest":       ["python", "-m", "pytest", "--tb=short", "-q"],
+    "pytest":       ["python", "-m", "pytest", "--tb=short", "-q", "-rs"],
     "unittest":     ["python", "-m", "unittest", "discover", "-v"],
     "cargo test":   ["cargo", "test"],
     "go test":      ["go", "test", "./..."],
